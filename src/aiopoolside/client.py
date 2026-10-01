@@ -116,14 +116,24 @@ class PoolsideClient:
 
     async def _async_connect_once(self) -> None:
         """Perform a single connection attempt: handshake, verify, wait for ready."""
+        # A controller that accepts the socket but never answers would
+        # otherwise stall this attempt - and with it the reconnect loop -
+        # forever, so both steps are bounded.
         try:
-            ws = await self._session.ws_connect(f"ws://{self._host}:{self._port}/")
+            async with asyncio.timeout(PING_TIMEOUT):
+                ws = await self._session.ws_connect(f"ws://{self._host}:{self._port}/")
+        except TimeoutError as err:
+            raise PoolsideConnectionError("Timed out connecting") from err
         except aiohttp.ClientError as err:
             raise PoolsideConnectionError(str(err)) from err
 
         noise = NoiseSession(self._client_private_key)
         try:
-            remote_static = await noise.handshake(ws)
+            async with asyncio.timeout(PING_TIMEOUT):
+                remote_static = await noise.handshake(ws)
+        except TimeoutError as err:
+            await ws.close()
+            raise PoolsideConnectionError("Timed out during handshake") from err
         except (NoiseTransportError, aiohttp.ClientError) as err:
             await ws.close()
             raise PoolsideConnectionError(str(err)) from err
@@ -175,10 +185,17 @@ class PoolsideClient:
         delay = RECONNECT_INITIAL_DELAY
         while not self._closing:
             if self._receive_task is not None:
-                await self._receive_task
+                # An unexpected error here must not end the loop, or the
+                # client would stay disconnected for good without a trace.
+                try:
+                    await self._receive_task
+                except Exception:
+                    LOGGER.exception("Receive loop failed")
             if self._closing:
                 return
             self._set_connected(False)
+            if self._ws is not None and not self._ws.closed:
+                await self._ws.close()
             await asyncio.sleep(delay + random.uniform(0, delay))
             delay = min(delay * 2, RECONNECT_MAX_DELAY)
             try:
@@ -189,6 +206,9 @@ class PoolsideClient:
                 return
             except PoolsideConnectionError as err:
                 LOGGER.debug("Reconnect attempt failed: %s", err)
+                continue
+            except Exception:
+                LOGGER.exception("Unexpected error while reconnecting")
                 continue
             delay = RECONNECT_INITIAL_DELAY
 
@@ -371,8 +391,11 @@ class PoolsideClient:
         until someone touches them from the HA side.
         """
         try:
-            items = await self.async_send_request("Device.getStatus", {})
-        except PoolsideConnectionError, PoolsideCommandError:
+            # Bounded so an unanswered request can't stall a (re)connect; a
+            # dead connection is then caught by the ping loop.
+            async with asyncio.timeout(PING_TIMEOUT):
+                items = await self.async_send_request("Device.getStatus", {})
+        except TimeoutError, PoolsideConnectionError, PoolsideCommandError:
             LOGGER.exception("Failed to fetch the initial status snapshot")
             return
         self._handle_status_push(items or [])

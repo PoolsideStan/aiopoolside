@@ -1,5 +1,6 @@
 """Tests for PoolsideClient's optimistic desired-state tracking."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import aiohttp
@@ -101,3 +102,77 @@ async def test_refresh_status_swallows_errors(
     send_request.side_effect = error
 
     await client.async_refresh_status()
+
+
+async def test_refresh_status_times_out(
+    client: PoolsideClient, send_request: AsyncMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unanswered getStatus gives up instead of stalling connect() forever."""
+    monkeypatch.setattr("aiopoolside.client.PING_TIMEOUT", 0.01)
+
+    async def never_answers(*_args: object) -> None:
+        await asyncio.Event().wait()
+
+    send_request.side_effect = never_answers
+
+    await asyncio.wait_for(client.async_refresh_status(), 1)
+
+
+async def test_reconnect_loop_survives_unexpected_error(
+    client: PoolsideClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected error from a reconnect attempt is logged and retried."""
+    monkeypatch.setattr("aiopoolside.client.RECONNECT_INITIAL_DELAY", 0)
+    calls = 0
+
+    async def connect_once() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        client._closing = True
+        client._receive_task = _finished_task()
+
+    client._async_connect_once = connect_once  # type: ignore[method-assign]
+    client._receive_task = _finished_task()
+
+    await asyncio.wait_for(client._async_reconnect_loop(), 1)
+
+    assert calls == 2
+    assert "Unexpected error while reconnecting" in caplog.text
+
+
+async def test_reconnect_loop_survives_failed_receive_loop(
+    client: PoolsideClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A receive loop that dies with an error still leads to a reconnect."""
+    monkeypatch.setattr("aiopoolside.client.RECONNECT_INITIAL_DELAY", 0)
+    calls = 0
+
+    async def failing_receive_loop() -> None:
+        raise RuntimeError("bad message")
+
+    async def connect_once() -> None:
+        nonlocal calls
+        calls += 1
+        client._closing = True
+        client._receive_task = _finished_task()
+
+    client._async_connect_once = connect_once  # type: ignore[method-assign]
+    client._receive_task = asyncio.ensure_future(failing_receive_loop())
+
+    await asyncio.wait_for(client._async_reconnect_loop(), 1)
+
+    assert calls == 1
+    assert "Receive loop failed" in caplog.text
+
+
+def _finished_task() -> asyncio.Future[None]:
+    """Return an already-completed future standing in for a receive task."""
+    future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    future.set_result(None)
+    return future
