@@ -151,6 +151,15 @@ COOLING_MODES_SUPPORTED_FIELD = "CoolingModesSupported"
 CURRENT_TEMPERATURE_FIELD = "Temperature"
 CURRENT_STATE_FIELD = "CurrentState"
 
+# TemperatureRiseInformation is a JSON document pushed while a body of water
+# heats (or cools) toward its set point; None when no heat-up is in progress.
+# TargetEndDateTime is the controller's predicted completion time (what the
+# app shows as "ready in"). Unset timestamps arrive as 0001-01-01
+# placeholders, e.g. TargetEndDateTime while TemperatureState is SAMPLING.
+TEMPERATURE_RISE_INFORMATION_FIELD = "TemperatureRiseInformation"
+TEMPERATURE_RISE_TARGET_END_KEY = "TargetEndDateTime"
+TEMPERATURE_RISE_ACTUAL_END_KEY = "ActualEndDateTime"
+
 # Site-level status items (Device.setStatus, keyed by the site UUID from
 # Site.getControlLayout). LastTimeSiteWasLoaded changes whenever the
 # attendant's site configuration is edited - a signal to re-fetch the
