@@ -6,14 +6,16 @@ so the full connect sequence - handshake, ready, initial status fetch - is
 exercised together rather than mocked piece by piece.
 """
 
+import asyncio
 import json
 from typing import Any
 
 from aiohttp import web
 from aiohttp.pytest_plugin import AiohttpClient
 from noise.connection import Keypair, NoiseConnection
+import pytest
 
-from aiopoolside.client import PoolsideClient
+from aiopoolside.client import PoolsideClient, PoolsideConnectionError
 from aiopoolside.const import NOISE_PROLOGUE, NOISE_PROTOCOL_NAME
 from aiopoolside.noise_transport import generate_keypair
 
@@ -125,3 +127,39 @@ async def test_async_connect_fetches_full_status_snapshot(
         assert client.get_status("control-1", "PowerState") == "ON"
     finally:
         await client.async_disconnect()
+
+
+async def test_async_connect_times_out_on_silent_controller(
+    aiohttp_client: AiohttpClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A controller that accepts the socket but never answers fails the attempt.
+
+    Without a bound, the handshake would wait forever - and with it the
+    reconnect loop, leaving the client disconnected for good.
+    """
+    monkeypatch.setattr("aiopoolside.client.PING_TIMEOUT", 0.1)
+
+    async def silent_handler(request: web.Request) -> web.WebSocketResponse:
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.receive()  # read the first handshake message, never reply
+        await ws.receive()  # stay open until the client gives up
+        return ws
+
+    app = web.Application()
+    app.router.add_get("/", silent_handler)
+    test_client = await aiohttp_client(app)
+    assert test_client.port is not None
+    client_private, _client_public = generate_keypair()
+    _server_private, server_public = generate_keypair()
+
+    client = PoolsideClient(
+        session=test_client.session,
+        host=test_client.host,
+        port=test_client.port,
+        client_private_key=client_private,
+        controller_public_key=server_public,
+        controller_uuid=CONTROLLER_UUID,
+    )
+    with pytest.raises(PoolsideConnectionError, match="handshake"):
+        await asyncio.wait_for(client.async_connect(), 5)
